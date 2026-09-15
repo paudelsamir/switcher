@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "paudelsamir.switcher",
+  "name": "Switcher",
+  "version": "2.0.0",
+  "author": "paudelsamir",
+  "license": "MIT",
+  "description": "A Niri-inspired scrolling layout, workspace overview, window switcher (AltTab), and workspace cycling (SuperTab), all individually toggleable. Styled with your Omarchy theme.",
+  "keepLoaded": true,
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "overlay": "SwitcherOverview.qml"
+  },
+  "barWidget": {
+    "displayName": "Switcher",
+    "description": "Toggle Niri-style tiling, workspace overview, window switcher, and workspace cycling.",
+    "category": "Window management",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

@@ -1,0 +1,186 @@
+#!/bin/bash
+# Turns one of Switcher's Hyprland configs on or off and reloads Hyprland.
+#
+#   switcher-toggle <mode|overview|alttab|workspace|all> [on|off|toggle|status]
+#
+# The lua sources live next to this script, inside the plugin directory, and
+# this script finds them relative to itself. Installing the plugin is therefore
+# the whole install: nothing has to be copied into ~/.config/hypr or
+# ~/.config/omarchy/bar/scripts first, and flipping a switch in the bar applies
+# the config on a machine that has never seen Switcher before.
+#
+# Turning one on copies its source into
+# ~/.local/state/omarchy/toggles/hypr/switcher-<name>.lua, the directory Omarchy's
+# default toggle loader sources on every reload -- the same contract
+# omarchy-hyprland-toggle uses for Omarchy's own flags, just sourced from the
+# plugin instead of $OMARCHY_PATH.
+#
+# `mode` carries the other three with it. The overview draws the scrolling
+# layout's workspaces, Alt-Tab (and Alt-Shift-Tab) walks the tape, and
+# Workspace decides who owns SUPER+TAB -- neither is meant to be left running
+# on a stock Hyprland layout, and neither is worth hunting for on a fresh
+# install either. Turning the mode on turns all three on, turning it off takes
+# all three down. Either one can still be switched off on its own afterwards;
+# the next flip of the mode is what sets them again.
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: switcher-toggle <mode|overview|alttab|workspace|all> [on|off|toggle|status]" >&2
+}
+
+if (($# < 1)); then
+  usage
+  exit 1
+fi
+
+NAME="$1"
+ACTION="${2:-toggle}"
+
+# BASH_SOURCE rather than $0: this is also run as `bash <path>/switcher-toggle`,
+# where the plugin directory may have lost its executable bits (a zip download,
+# a copy across filesystems), and $0 is then the path bash was handed anyway.
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+TOGGLES_DIR="$STATE_HOME/omarchy/toggles/hypr"
+# Written by the version that remembered which companions were up across a
+# `mode off`. The cascade is unconditional now and nothing reads this, so an
+# upgraded install is carrying a state file whose meaning is gone: clear it on
+# any run that changes state, and take the directory with it once it is empty.
+STALE_SUSPENDED_FILE="$STATE_HOME/switcher/suspended"
+
+# The configs `mode` pulls along behind it, in the order the popup lists them.
+COMPANIONS=(overview alttab workspace)
+
+clear_stale_state() {
+  rm -f "$STALE_SUSPENDED_FILE"
+  # Only succeeds while the directory holds nothing else, which is the only
+  # case where removing it is this script's business.
+  rmdir "$(dirname "$STALE_SUSPENDED_FILE")" 2>/dev/null || true
+}
+
+flag_file() {
+  echo "$TOGGLES_DIR/switcher-$1.lua"
+}
+
+# Copy the source in rather than symlink it: the toggles directory is Omarchy's
+# state, and a link into a plugin directory that gets moved or deleted would
+# leave a reload sourcing a dangling path.
+on() {
+  local name="$1"
+  local source="$PLUGIN_DIR/hypr/switcher-$name.lua"
+  local flag
+  flag="$(flag_file "$name")"
+  if [[ ! -f $source ]]; then
+    echo "Missing $source -- the plugin install is incomplete." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$flag")"
+  # Copy to a temp file in the destination directory and rename it into place,
+  # so a reload triggered while the copy is in flight never sources a half
+  # written lua file.
+  local tmp
+  tmp="$(mktemp "$(dirname "$flag")/.switcher-$name.XXXXXX")"
+  cp "$source" "$tmp"
+  # mktemp creates 0600 and the rename carries that over, which would leave
+  # the flag file more restrictive than the plain `cp` this replaced. Nothing
+  # reads it but this user's Hyprland, so the mode is cosmetic -- but a
+  # toggles directory where one file looks different invites a second look.
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$flag"
+}
+
+off() {
+  rm -f "$(flag_file "$1")"
+}
+
+# ------------------------------------------------------------ mode's cascade
+#
+# Unconditional in both directions, and deliberately not a memory of what was
+# up last time: `mode on` is the one switch a new install is told to find, so
+# it hands over the whole feature rather than the third of it that happened to
+# survive the last `mode off`. Both actions are idempotent, so there is nothing
+# to test before running them.
+cascade_companions() {
+  local action="$1" name
+  for name in "${COMPANIONS[@]}"; do
+    "$action" "$name"
+  done
+}
+
+case $NAME in
+  mode | overview | alttab | workspace) ;;
+  all)
+    if [[ $ACTION != off ]]; then
+      echo "The 'all' target only supports the 'off' action." >&2
+      usage
+      exit 1
+    fi
+    rm -f "$TOGGLES_DIR/switcher-mode.lua" \
+      "$TOGGLES_DIR/switcher-overview.lua" \
+      "$TOGGLES_DIR/switcher-alttab.lua" \
+      "$TOGGLES_DIR/switcher-workspace.lua"
+    clear_stale_state
+    hyprctl reload >/dev/null 2>&1 || true
+    echo "off"
+    exit 0
+    ;;
+  *)
+    echo "Unknown Switcher config: $NAME" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+FLAG_FILE="$(flag_file "$NAME")"
+
+# `status` answers about one flag and changes nothing, so it is out before the
+# cascade below has a chance to have an opinion.
+if [[ $ACTION == status ]]; then
+  [[ -f $FLAG_FILE ]] && echo "on" || echo "off"
+  exit 0
+fi
+
+# Resolve `toggle` to the state being asked for, so the cascade has one thing
+# to test instead of the same file twice.
+if [[ $ACTION == toggle ]]; then
+  if [[ -f $FLAG_FILE ]]; then ACTION=off; else ACTION=on; fi
+fi
+
+clear_stale_state
+
+case $ACTION in
+  on)
+    on "$NAME"
+    # `if` rather than `[[ ... ]] && ...`: a failed test as the last command of
+    # a case branch is a non-zero status for the whole case, and `set -e` reads
+    # that as the script having failed -- which it did, silently, for every
+    # `switcher-toggle overview on` this was written with.
+    if [[ $NAME == mode ]]; then
+      cascade_companions on
+    fi
+    ;;
+  off)
+    # Companions first: they are taken down while the mode is still nominally
+    # on, so a reload racing this never sees an overview bound over a layout
+    # that is no longer scrolling.
+    if [[ $NAME == mode ]]; then
+      cascade_companions off
+    fi
+    off "$NAME"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
+
+# A reload is what actually applies the change -- one for the whole cascade,
+# not one per flag. Hyprland not running (the shell under a nested session, a
+# reload racing a compositor restart) is not a reason to report the toggle
+# itself as failed -- the flag files are already correct and the next reload
+# picks them up.
+hyprctl reload >/dev/null 2>&1 || echo "Config written, but 'hyprctl reload' failed." >&2
+
+[[ -f $FLAG_FILE ]] && echo "on" || echo "off"
