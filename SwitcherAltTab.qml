@@ -13,12 +13,19 @@ Item {
 
   property bool active: false
   property bool leaving: false
+  property bool pendingQuick: false
+  property bool revealed: false
 
-  readonly property bool surfaceLive: root.active || root.leaving
+  readonly property bool surfaceLive: (root.active || root.leaving) && root.revealed
 
   readonly property real captureBudget: 12
   readonly property int captureCooldownMs: 1500
   property real captureTokens: 0
+  property int captureCursor: 0
+  readonly property int previewLimit: 32
+  readonly property int previewWidth: 640
+  readonly property int previewFreshMs: 30000
+  property var previewCache: ({})
 
   Timer {
     id: captureTick
@@ -28,18 +35,36 @@ Item {
     onTriggered: root.captureTock()
   }
 
+  Timer {
+    id: revealTimer
+    interval: 90
+    repeat: false
+    onTriggered: root.revealPending()
+  }
+
   function captureNext() {
+    var count = cards.count
+    if (count < 1) return null
     var now = Date.now()
     var blank = null
     var stale = null, staleAge = -1
-    for (var i = 0; i < cards.count; i++) {
-      var c = cards.itemAt(i)
-      if (!c || !c.requestCapture || !c.near) continue
-      if (!c.hasPicture) { if (!blank) blank = c; continue }
+    for (var offset = 0; offset < count; offset++) {
+      var index = (root.captureCursor + offset) % count
+      var c = cards.itemAt(index)
+      if (!c || !c.requestCapture) continue
+      if (!c.hasPicture) {
+        if (!blank) blank = c
+        continue
+      }
       var age = now - c.lastCaptureMs
-      if (age >= root.captureCooldownMs && age > staleAge) { staleAge = age; stale = c }
+      if (age >= root.captureCooldownMs && age > staleAge) {
+        staleAge = age
+        stale = c
+      }
     }
-    return blank || stale
+    var chosen = blank || stale
+    if (chosen) root.captureCursor = (chosen.index + 1) % count
+    return chosen
   }
 
   function captureTock() {
@@ -50,6 +75,42 @@ Item {
     if (!c) return
     root.captureTokens -= 1
     c.requestCapture()
+  }
+
+  function previewFor(address) {
+    var key = String(address || "")
+    return key && root.previewCache[key] ? root.previewCache[key] : null
+  }
+
+  function keepPreview(address, result) {
+    var key = String(address || "")
+    if (!key || !result || !result.url) return false
+    var next = Object.assign({}, root.previewCache)
+    next[key] = { url: String(result.url), takenAt: Date.now(), result: result }
+    var keys = Object.keys(next)
+    if (keys.length > root.previewLimit) {
+      keys.sort(function(a, b) { return next[a].takenAt - next[b].takenAt })
+      for (var i = 0; i < keys.length - root.previewLimit; i++) delete next[keys[i]]
+    }
+    root.previewCache = next
+    return true
+  }
+
+  function wantsPreview(address) {
+    var preview = root.previewFor(address)
+    return !preview || Date.now() - preview.takenAt > root.previewFreshMs
+  }
+
+  function sweepPreviews() {
+    var present = {}
+    for (var i = 0; i < root.entries.length; i++) {
+      if (root.entries[i].address) present[String(root.entries[i].address)] = true
+    }
+    var next = {}
+    for (var key in root.previewCache) {
+      if (present[key]) next[key] = root.previewCache[key]
+    }
+    root.previewCache = next
   }
 
   property string scope: "all"
@@ -247,10 +308,11 @@ Item {
   }
 
   function step(dir) {
-    if (!root.active) { root.begin(dir); return }
+    if (!root.active && !root.pendingQuick) { root.begin(dir); return }
     if (root.count === 0) return
     var delta = (dir === "prev") ? -1 : 1
     root.selected = ((root.selected + delta) % root.count + root.count) % root.count
+    if (root.pendingQuick) revealTimer.restart()
   }
 
   function begin(dir) {
@@ -265,26 +327,46 @@ Item {
 
     root.scope = root.persistedScope
     root.entries = root.snapshot()
+    root.sweepPreviews()
+    root.captureCursor = 0
 
     var list = root.filtered(root.entries, root.scope)
 
-    if (list.length === 0) { root.entries = []; root.notifyClosed(); return }
+    if (list.length === 0) {
+      root.entries = []
+      root.pendingQuick = false
+      root.revealed = false
+      revealTimer.stop()
+      root.notifyClosed()
+      return
+    }
 
     root.selected = (dir === "prev") ? (list.length - 1) : (list.length > 1 ? 1 : 0)
 
     root.targetScreen = root.pickScreen()
     exitFade.stop()
     root.exitOpacity = 1
-    root.grabsKeyboard = true
-
-    root.active = true
+    root.grabsKeyboard = false
+    root.active = false
     root.leaving = false
+    root.revealed = false
+    root.pendingQuick = true
     strip.settleNow()
+    revealTimer.restart()
+  }
+
+  function revealPending() {
+    if (!root.pendingQuick) return
+    root.pendingQuick = false
+    root.revealed = true
+    root.active = true
+    root.grabsKeyboard = true
   }
 
   function move(delta) {
-    if (!root.active || root.count === 0) return
+    if ((!root.active && !root.pendingQuick) || root.count === 0) return
     root.selected = ((root.selected + delta) % root.count + root.count) % root.count
+    if (root.pendingQuick) revealTimer.restart()
   }
 
   function setScope(next) {
@@ -304,16 +386,41 @@ Item {
   }
 
   function commit(entry) {
-    if (!root.active) return
+    if (!root.active && !root.pendingQuick) return
+    var quick = root.pendingQuick
     var target = entry || root.currentEntry()
+    revealTimer.stop()
+    root.pendingQuick = false
     root.notifyClosed()
-    if (!target) { root.dismiss(); return }
+    if (!target) {
+      if (!root.revealed) {
+        root.active = false
+        root.leaving = false
+        root.grabsKeyboard = false
+        root.entries = []
+        root.selected = 0
+      } else {
+        root.dismiss()
+      }
+      return
+    }
+    if (quick) root.revealed = false
     root.beginHandOff("hl.dsp.focus({ window = 'address:" + target.address + "' })")
   }
 
   function dismiss() {
-    if (!root.surfaceLive) return
+    if (!root.surfaceLive && !root.pendingQuick) return
+    revealTimer.stop()
+    root.pendingQuick = false
     root.notifyClosed()
+    if (!root.revealed) {
+      root.active = false
+      root.leaving = false
+      root.grabsKeyboard = false
+      root.exitOpacity = 1
+      root.entries = []
+      return
+    }
     root.leaving = true
     root.active = false
     root.grabsKeyboard = false
@@ -321,6 +428,9 @@ Item {
   }
 
   function finish() {
+    revealTimer.stop()
+    root.pendingQuick = false
+    root.revealed = false
     root.leaving = false
     root.exitOpacity = 1
     root.entries = []
@@ -679,13 +789,35 @@ Item {
                 return left + card.width > -slack && left < viewport.width + slack
               }
 
-              visible: card.near
-
+              readonly property var preview: root.previewCache[String(card.modelData.address)] || null
+              readonly property bool hasPreview: card.preview !== null
               property real lastCaptureMs: 0
               readonly property bool hasPicture: shotView.hasContent
+
+              function takePreview() {
+                if (!shotView.hasContent || !root.surfaceLive || !root.wantsPreview(card.modelData.address)) return
+                var sourceWidth = shotView.sourceSize && shotView.sourceSize.width > 0
+                  ? shotView.sourceSize.width : shot.width
+                var sourceHeight = shotView.sourceSize && shotView.sourceSize.height > 0
+                  ? shotView.sourceSize.height : shot.height
+                var width = Math.max(1, Math.min(root.previewWidth, sourceWidth))
+                var height = Math.max(1, Math.round(width * sourceHeight / Math.max(1, sourceWidth)))
+                captureBox.grabToImage(function(result) {
+                  root.keepPreview(card.modelData.address, result)
+                }, Qt.size(width, height))
+              }
+
               function requestCapture() {
                 if (!shotView.live) shotView.captureFrame()
                 card.lastCaptureMs = Date.now()
+                previewTimer.restart()
+              }
+
+              Timer {
+                id: previewTimer
+                interval: 300
+                repeat: false
+                onTriggered: card.takePreview()
               }
 
               x: panel.cardXAt(card.index)
@@ -733,6 +865,15 @@ Item {
                     layer.smooth: true
                     layer.mipmap: true
 
+                    Image {
+                      anchors.fill: parent
+                      visible: !shotView.hasContent && card.hasPreview
+                      source: card.preview ? card.preview.url : ""
+                      fillMode: Image.PreserveAspectCrop
+                      cache: false
+                      smooth: true
+                    }
+
                     ScreencopyView {
                       id: shotView
                       anchors.fill: parent
@@ -740,11 +881,14 @@ Item {
 
                       live: root.surfaceLive && card.near
                       paintCursor: false
+                      onHasContentChanged: {
+                        if (hasContent) previewTimer.restart()
+                      }
                     }
 
                     Rectangle {
                       anchors.fill: parent
-                      visible: !shotView.hasContent
+                      visible: !shotView.hasContent && !card.hasPreview
                       color: Util.alpha(Color.background, 0.92)
 
                       Text {
@@ -758,6 +902,7 @@ Item {
                         elide: Text.ElideRight
                       }
                     }
+
                   }
                 }
 
